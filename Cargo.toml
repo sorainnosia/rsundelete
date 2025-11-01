@@ -1,0 +1,37 @@
+[package]
+name = "rsundelete"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"
+anyhow = "1.0"
+chrono = "0.4"
+image = "0.25"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-Ctarget-feature=+crt-static","-Clink-arg=-static"]
+[target.i686-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Ctarget-feature=+crt-static"]
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-Ctarget-feature=+crt-static"]
+[target.x86_64-apple-darwin]
+rustflags = ["-Ctarget-feature=+crt-static"]
+
