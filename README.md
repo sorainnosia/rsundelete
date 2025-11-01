@@ -1,6 +1,8 @@
 # rsundelete
 A tiny Rust file recovery for NTFS and exFAT file system. Recover deleted file into new drive.
 
+<img width="600" height="1460" alt="image" src="https://github.com/user-attachments/assets/012f1e13-cbb4-4b27-9f13-91ce4703bc1a" />
+
 # Operating System
 Windows
 
