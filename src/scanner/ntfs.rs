@@ -1,15 +1,25 @@
 use super::{DeletedFile, FileSystemScanner};
 use super::disk_access::DiskHandle;
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::Arc;
 
 const FILE_RECORD_SEGMENT_IN_USE: u16 = 0x0001;
 
 pub struct NtfsScanner {
     drive_letter: char,
     path_cache: HashMap<u64, String>, // Cache for reconstructing paths
+    // Configuration limits
+    mft_system_drive_limit: u64,
+    mft_spare_drive_limit: u64,
+    usn_journal_limit: u64,
+    file_carving_cluster_limit: u64,
+    file_carving_max_files: u64,
+    parallel_threads: usize,
 }
 
 impl NtfsScanner {
@@ -17,7 +27,38 @@ impl NtfsScanner {
         Self {
             drive_letter,
             path_cache: HashMap::new(),
+            // Default values
+            mft_system_drive_limit: 300_000,
+            mft_spare_drive_limit: 10_000_000,
+            usn_journal_limit: 1_000_000,
+            file_carving_cluster_limit: 500_000_000,
+            file_carving_max_files: 100_000,
+            parallel_threads: 4,
         }
+    }
+
+    /// Set configuration limits for scanning
+    pub fn set_config(
+        &mut self,
+        mft_system_drive_limit: u64,
+        mft_spare_drive_limit: u64,
+        usn_journal_limit: u64,
+        file_carving_cluster_limit: u64,
+        file_carving_max_files: u64,
+        parallel_threads: usize,
+    ) {
+        self.mft_system_drive_limit = mft_system_drive_limit;
+        self.mft_spare_drive_limit = mft_spare_drive_limit;
+        self.usn_journal_limit = usn_journal_limit;
+        self.file_carving_cluster_limit = file_carving_cluster_limit;
+        self.file_carving_max_files = file_carving_max_files;
+        self.parallel_threads = parallel_threads.max(1).min(32); // Clamp between 1-32
+    }
+
+    /// Detect if this is a system drive (C:) which requires USN Journal for better recovery
+    fn is_system_drive(&self) -> bool {
+        // System drive is typically C:
+        self.drive_letter.to_ascii_uppercase() == 'C'
     }
 
     fn read_boot_sector(&self, disk: &DiskHandle) -> Result<NtfsBootSector> {
@@ -102,7 +143,7 @@ impl NtfsScanner {
         }))
     }
 
-    fn extract_file_info(&mut self, record: &MftRecord, record_num: u64) -> Result<Option<DeletedFileInfo>> {
+    fn extract_file_info(&self, record: &MftRecord, record_num: u64) -> Result<Option<DeletedFileInfo>> {
         // We want deleted files
         if record.is_in_use {
             return Ok(None);
@@ -345,7 +386,7 @@ impl NtfsScanner {
         cluster_ranges
     }
 
-    fn build_path(&mut self, disk: &DiskHandle, boot_sector: &NtfsBootSector, parent_ref: Option<u64>, filename: &str) -> String {
+    fn build_path(&self, disk: &DiskHandle, boot_sector: &NtfsBootSector, parent_ref: Option<u64>, filename: &str) -> String {
         let mut path_components = vec![filename.to_string()];
         let mut current_ref = parent_ref;
 
@@ -438,10 +479,12 @@ impl FileSystemScanner for NtfsScanner {
         folder_path: Option<&str>,
         filename_filter: Option<&str>,
     ) -> Result<Vec<DeletedFile>> {
-        // Create log file FIRST, before anything else
-        let log_path = std::env::var("USERPROFILE")
-            .map(|base| format!("{}\\Desktop\\rsundelete_debug.log", base))
-            .unwrap_or_else(|_| "C:\\rsundelete_debug.log".to_string());
+        // Create log file FIRST, in the executable directory
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe_path| exe_path.parent().map(|p| p.join("rsundelete_debug.log")))
+            .and_then(|path| path.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "rsundelete_debug.log".to_string());
 
         let mut log_file = OpenOptions::new()
             .create(true)
@@ -572,16 +615,32 @@ impl FileSystemScanner for NtfsScanner {
 
                             // Apply filters
                             let mut include = true;
+                            let mut filter_reason = String::new();
 
                             if let Some(filter) = filename_filter {
                                 if !filter.is_empty() && !file_info.filename.to_lowercase().contains(&filter.to_lowercase()) {
                                     include = false;
+                                    filter_reason = format!("filename filter '{}' doesn't match '{}'", filter, file_info.filename);
                                 }
                             }
 
                             if let Some(path_filter) = folder_path {
                                 if !path_filter.is_empty() && !full_path.to_lowercase().contains(&path_filter.to_lowercase()) {
                                     include = false;
+                                    if filter_reason.is_empty() {
+                                        filter_reason = format!("path filter '{}' doesn't match '{}'", path_filter, full_path);
+                                    } else {
+                                        filter_reason.push_str(&format!(" AND path filter '{}' doesn't match '{}'", path_filter, full_path));
+                                    }
+                                }
+                            }
+
+                            // Log filtered files for debugging
+                            if !include {
+                                if let Some(ref mut log) = log_file {
+                                    let _ = writeln!(log, "FILTERED OUT - Name: '{}', Path: '{}', Size: {} bytes, Reason: {}",
+                                        file_info.filename, full_path, file_info.size, filter_reason);
+                                    let _ = log.flush();
                                 }
                             }
 
@@ -590,6 +649,7 @@ impl FileSystemScanner for NtfsScanner {
                                     name: file_info.filename.clone(),
                                     path: full_path.clone(),
                                     size: file_info.size,
+                                    size_formatted: crate::scanner::DeletedFile::format_size(file_info.size),
                                     deleted_time: None,
                                     file_record: file_info.record_num,
                                     clusters: Vec::new(), // Empty for NTFS (uses cluster_ranges instead)
@@ -655,11 +715,14 @@ impl FileSystemScanner for NtfsScanner {
         filename_filter: Option<&str>,
         files_output: &std::sync::Arc<std::sync::Mutex<Vec<DeletedFile>>>,
         should_stop: &std::sync::Arc<std::sync::Mutex<bool>>,
+        scan_status: &std::sync::Arc<std::sync::Mutex<String>>,
     ) -> Result<bool> {
         // Reuse the same scan logic but with real-time updates
-        let log_path = std::env::var("USERPROFILE")
-            .map(|base| format!("{}\\Desktop\\rsundelete_debug.log", base))
-            .unwrap_or_else(|_| "C:\\rsundelete_debug.log".to_string());
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe_path| exe_path.parent().map(|p| p.join("rsundelete_debug.log")))
+            .and_then(|path| path.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "rsundelete_debug.log".to_string());
 
         let mut log_file = OpenOptions::new()
             .create(true)
@@ -680,6 +743,9 @@ impl FileSystemScanner for NtfsScanner {
         let disk = DiskHandle::open(drive_letter).context("Failed to open disk for NTFS scanning")?;
         let boot_sector = self.read_boot_sector(&disk).context("Failed to read NTFS boot sector")?;
 
+        // Automatic detection: Use USN Journal for system drives
+        let use_journal = self.is_system_drive();
+
         let bytes_per_cluster = boot_sector.bytes_per_sector as u64 * boot_sector.sectors_per_cluster as u64;
         let mft_record_size = if boot_sector.clusters_per_mft_record >= 0 {
             boot_sector.clusters_per_mft_record as u64 * bytes_per_cluster
@@ -687,46 +753,230 @@ impl FileSystemScanner for NtfsScanner {
             1u64 << (-boot_sector.clusters_per_mft_record as u64)
         };
 
-        let max_records = 10_000_000u64.min(boot_sector.total_sectors * boot_sector.bytes_per_sector as u64 / mft_record_size);
-        let mut consecutive_errors = 0;
-        let mut total_deleted_found = 0;
+        // System drives: Configured MFT scan (fast) + USN Journal (comprehensive)
+        // Spare drives: Configured MFT scan (comprehensive, no journal)
+        let max_mft_records = if use_journal {
+            self.mft_system_drive_limit // System drive: quick MFT scan, rely on USN Journal
+        } else {
+            self.mft_spare_drive_limit // Spare drive: comprehensive MFT scan
+        };
 
-        for record_num in 0..max_records {
-            // Check if we should stop
+        if let Some(ref mut log) = log_file {
+            if use_journal {
+                let _ = writeln!(log, "SYSTEM DRIVE DETECTED - Using USN Journal for improved recovery");
+                let _ = writeln!(log, "Strategy: Fast MFT scan (300K records) + USN Journal scan (comprehensive)");
+            } else {
+                let _ = writeln!(log, "Spare drive - MFT-only scanning (up to 10M records)");
+            }
+            let _ = log.flush();
+        }
+
+        let max_records = max_mft_records.min(boot_sector.total_sectors * boot_sector.bytes_per_sector as u64 / mft_record_size);
+
+        // Parallel MFT scanning
+        let should_terminate = Arc::new(AtomicBool::new(false));
+        let progress_counter = Arc::new(AtomicU64::new(0));
+        let error_counter = Arc::new(AtomicU64::new(0));
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.parallel_threads)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+        if let Some(ref mut log) = log_file {
+            let _ = writeln!(log, "MFT scanning using {} parallel threads", self.parallel_threads);
+            let _ = log.flush();
+        }
+
+        // Process MFT records in parallel chunks
+        let chunk_size = 10_000u64;
+        let total_chunks = (max_records + chunk_size - 1) / chunk_size;
+
+        pool.install(|| {
+            (0..total_chunks).into_par_iter().for_each(|chunk_idx| {
+                if should_terminate.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                if *should_stop.lock().unwrap() {
+                    should_terminate.store(true, Ordering::Relaxed);
+                    return;
+                }
+
+                let chunk_start = chunk_idx * chunk_size;
+                let chunk_end = ((chunk_idx + 1) * chunk_size).min(max_records);
+
+                // Each thread opens its own disk handle
+                let thread_disk = match DiskHandle::open(self.drive_letter) {
+                    Ok(d) => d,
+                    Err(_) => return,
+                };
+
+                for record_num in chunk_start..chunk_end {
+                    if should_terminate.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let processed = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+                    // Progress update every 50,000 records
+                    if processed % 50_000 == 0 {
+                        let progress = (processed as f64 / max_records as f64) * 100.0;
+                        *scan_status.lock().unwrap() = format!(
+                            "MFT Scan: {:.1}% ({}/{} records, {} files)",
+                            progress, processed, max_records, files_output.lock().unwrap().len()
+                        );
+                    }
+
+                    match self.read_mft_record(&thread_disk, &boot_sector, record_num) {
+                        Ok(record_data) => {
+                            error_counter.store(0, Ordering::Relaxed);
+
+                            if let Ok(Some(record)) = self.parse_mft_record(&record_data) {
+                                if let Ok(Some(file_info)) = self.extract_file_info(&record, record_num) {
+                                    let full_path = self.build_path(&thread_disk, &boot_sector, file_info.parent_ref, &file_info.filename);
+
+                                    // Apply filters
+                                    let mut include = true;
+
+                                    if let Some(filter) = filename_filter {
+                                        if !filter.is_empty() && !file_info.filename.to_lowercase().contains(&filter.to_lowercase()) {
+                                            include = false;
+                                        }
+                                    }
+
+                                    if let Some(path_filter) = folder_path {
+                                        if !path_filter.is_empty() && !full_path.to_lowercase().contains(&path_filter.to_lowercase()) {
+                                            include = false;
+                                        }
+                                    }
+
+                                    if include {
+                                        files_output.lock().unwrap().push(DeletedFile {
+                                            name: file_info.filename.clone(),
+                                            path: full_path.clone(),
+                                            size: file_info.size,
+                                            size_formatted: crate::scanner::DeletedFile::format_size(file_info.size),
+                                            deleted_time: None,
+                                            file_record: file_info.record_num,
+                                            clusters: Vec::new(),
+                                            cluster_ranges: file_info.cluster_ranges.clone(),
+                                            is_recoverable: file_info.size > 0 && !file_info.cluster_ranges.is_empty(),
+                                            filesystem_type: "NTFS".to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let errors = error_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            if errors > 100 && record_num > 1000 {
+                                should_terminate.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        if let Some(ref mut log) = log_file {
+            let _ = writeln!(log, "MFT scan complete. Found {} files", files_output.lock().unwrap().len());
+            let _ = log.flush();
+        }
+
+        // If system drive, also scan USN Journal for better recovery
+        if use_journal {
+            // Update status for USN Journal phase
+            *scan_status.lock().unwrap() = "USN Journal: Reading change journal...".to_string();
+
+            if let Some(ref mut log) = log_file {
+                let _ = writeln!(log, "");
+                let _ = writeln!(log, "=== Starting USN Journal Scan ===");
+                let _ = log.flush();
+            }
+
+            // Check if user requested stop
             if *should_stop.lock().unwrap() {
                 if let Some(ref mut log) = log_file {
-                    let _ = writeln!(log, "Scan STOPPED by user at record {}", record_num);
+                    let _ = writeln!(log, "Scan STOPPED before USN Journal phase");
                     let _ = log.flush();
                 }
-                return Ok(true); // Return true to indicate scan was stopped
+                return Ok(true);
             }
 
-            // Progress update every 50,000 records
-            if record_num > 0 && record_num % 50_000 == 0 {
-                if let Some(ref mut log) = log_file {
-                    let progress = (record_num as f64 / max_records as f64) * 100.0;
-                    let _ = writeln!(log, "Progress: {:.1}% ({}/{} records, {} files found)",
-                                    progress, record_num, max_records, total_deleted_found);
-                    let _ = log.flush();
-                }
-            }
+            let journal_parser = crate::scanner::usn_journal::UsnJournalParser::new(drive_letter);
 
-            match self.read_mft_record(&disk, &boot_sector, record_num) {
-                Ok(record_data) => {
-                    consecutive_errors = 0;
+            match journal_parser.find_deleted_files(&disk) {
+                Ok(journal_files) => {
+                    // Update status
+                    *scan_status.lock().unwrap() = format!(
+                        "USN Journal: Processing {} records...",
+                        journal_files.len()
+                    );
 
-                    if let Ok(Some(record)) = self.parse_mft_record(&record_data) {
-                        if let Ok(Some(file_info)) = self.extract_file_info(&record, record_num) {
-                            total_deleted_found += 1;
+                    if let Some(ref mut log) = log_file {
+                        let _ = writeln!(log, "USN Journal: Found {} deleted file records", journal_files.len());
+                        let _ = log.flush();
+                    }
 
-                            let full_path = self.build_path(&disk, &boot_sector, file_info.parent_ref, &file_info.filename);
-                            let total_clusters: u64 = file_info.cluster_ranges.iter().map(|r| r.count).sum();
+                    // Get MFT record numbers already found from MFT scan (to avoid duplicates)
+                    let mft_records: std::collections::HashSet<u64> = files_output
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|f| f.file_record)
+                        .collect();
+
+                    // Build MFT cache once for all journal records (performance optimization)
+                    let mft_cache = self.build_mft_cache_for_journal(&disk, &boot_sector);
+                    let total_journal_records = journal_files.len();
+
+                    // Parallel USN Journal processing
+                    let journal_added = Arc::new(AtomicU64::new(0));
+                    let journal_progress = Arc::new(AtomicU64::new(0));
+                    let should_terminate_journal = Arc::new(AtomicBool::new(false));
+
+                    if let Some(ref mut log) = log_file {
+                        let _ = writeln!(log, "USN Journal processing using {} parallel threads", self.parallel_threads);
+                        let _ = log.flush();
+                    }
+
+                    pool.install(|| {
+                        journal_files.into_par_iter().for_each(|usn_record| {
+                            if should_terminate_journal.load(Ordering::Relaxed) {
+                                return;
+                            }
+
+                            if *should_stop.lock().unwrap() {
+                                should_terminate_journal.store(true, Ordering::Relaxed);
+                                return;
+                            }
+
+                            let idx = journal_progress.fetch_add(1, Ordering::Relaxed);
+
+                            // Update progress every 100 records
+                            if idx % 100 == 0 {
+                                *scan_status.lock().unwrap() = format!(
+                                    "USN Journal: {}/{} records ({} files added)",
+                                    idx, total_journal_records, journal_added.load(Ordering::Relaxed)
+                                );
+                            }
+
+                            let mft_num = usn_record.mft_record_number();
+
+                            // Skip if we already have this file from MFT scan
+                            if mft_records.contains(&mft_num) {
+                                return;
+                            }
+
+                            // Build path from USN record
+                            let full_path = journal_parser.build_path_from_record(&usn_record, &mft_cache);
 
                             // Apply filters
                             let mut include = true;
 
                             if let Some(filter) = filename_filter {
-                                if !filter.is_empty() && !file_info.filename.to_lowercase().contains(&filter.to_lowercase()) {
+                                if !filter.is_empty() && !usn_record.filename.to_lowercase().contains(&filter.to_lowercase()) {
                                     include = false;
                                 }
                             }
@@ -738,43 +988,320 @@ impl FileSystemScanner for NtfsScanner {
                             }
 
                             if include {
-                                // Push to output immediately for real-time updates!
-                                files_output.lock().unwrap().push(DeletedFile {
-                                    name: file_info.filename.clone(),
-                                    path: full_path.clone(),
-                                    size: file_info.size,
-                                    deleted_time: None,
-                                    file_record: file_info.record_num,
-                                    clusters: Vec::new(),
-                                    cluster_ranges: file_info.cluster_ranges.clone(),
-                                    is_recoverable: file_info.size > 0 && !file_info.cluster_ranges.is_empty(),
-                                    filesystem_type: "NTFS".to_string(),
-                                });
+                                journal_added.fetch_add(1, Ordering::Relaxed);
 
-                                // Log first 10 deleted files
-                                if files_output.lock().unwrap().len() <= 10 {
-                                    if let Some(ref mut log) = log_file {
-                                        let _ = writeln!(log, "File #{}: '{}' at '{}', size: {} bytes, {} ranges, {} clusters",
-                                                        files_output.lock().unwrap().len(), file_info.filename, full_path,
-                                                        file_info.size, file_info.cluster_ranges.len(), total_clusters);
-                                        let _ = log.flush();
-                                    }
-                                }
+                                files_output.lock().unwrap().push(DeletedFile {
+                                    name: usn_record.filename.clone(),
+                                    path: full_path.clone(),
+                                    size: 0,
+                                    size_formatted: crate::scanner::DeletedFile::format_size(0),
+                                    deleted_time: Some(usn_record.timestamp),
+                                    file_record: mft_num,
+                                    clusters: Vec::new(),
+                                    cluster_ranges: Vec::new(),
+                                    is_recoverable: false,
+                                    filesystem_type: "NTFS (from USN Journal)".to_string(),
+                                });
                             }
-                        }
+                        });
+                    });
+
+                    let final_journal_added = journal_added.load(Ordering::Relaxed);
+
+                    if let Some(ref mut log) = log_file {
+                        let _ = writeln!(log, "Added {} unique files from USN Journal", final_journal_added);
+                        let _ = log.flush();
                     }
                 }
-                Err(_) => {
-                    consecutive_errors += 1;
-                    if consecutive_errors > 100 && record_num > 1000 {
-                        break;
+                Err(e) => {
+                    // Log error but continue with MFT results
+                    if let Some(ref mut log) = log_file {
+                        let _ = writeln!(log, "USN Journal scan failed: {}", e);
+                        let _ = writeln!(log, "Continuing with MFT results only");
+                        let _ = log.flush();
                     }
                 }
             }
         }
 
+        // File carving - always run for comprehensive recovery
+        // Update status for file carving
+        *scan_status.lock().unwrap() = "File Carving: Searching for file signatures...".to_string();
+
         if let Some(ref mut log) = log_file {
-            let _ = writeln!(log, "Scan complete. Found {} files", files_output.lock().unwrap().len());
+            let _ = writeln!(log, "");
+            let _ = writeln!(log, "=== Starting File Carving Scan ===");
+            let _ = log.flush();
+        }
+
+        // Check if user requested stop
+        if *should_stop.lock().unwrap() {
+            if let Some(ref mut log) = log_file {
+                let _ = writeln!(log, "Scan STOPPED before File Carving phase");
+                let _ = log.flush();
+            }
+
+            if let Some(ref mut log) = log_file {
+                let _ = writeln!(log, "");
+                let _ = writeln!(log, "=== Scan Summary ===");
+                let _ = writeln!(log, "Total files found: {}", files_output.lock().unwrap().len());
+                let _ = log.flush();
+            }
+
+            return Ok(true);
+        }
+
+        {
+
+            // Define signatures to search for (most common file types)
+            let signatures = vec![
+                // Documents
+                crate::scanner::file_carving::FileSignature::PDF,
+                crate::scanner::file_carving::FileSignature::DOCX,
+                crate::scanner::file_carving::FileSignature::XLSX,
+                crate::scanner::file_carving::FileSignature::PPTX,
+                crate::scanner::file_carving::FileSignature::DOC,
+                crate::scanner::file_carving::FileSignature::XLS,
+                crate::scanner::file_carving::FileSignature::PPT,
+                crate::scanner::file_carving::FileSignature::ODT,
+                crate::scanner::file_carving::FileSignature::ODS,
+                crate::scanner::file_carving::FileSignature::ODP,
+
+                // Images
+                crate::scanner::file_carving::FileSignature::JPEG,
+                crate::scanner::file_carving::FileSignature::PNG,
+                crate::scanner::file_carving::FileSignature::GIF,
+                crate::scanner::file_carving::FileSignature::BMP,
+                crate::scanner::file_carving::FileSignature::WEBP,
+                crate::scanner::file_carving::FileSignature::TIFF,
+
+                // Videos
+                crate::scanner::file_carving::FileSignature::MP4,
+                crate::scanner::file_carving::FileSignature::AVI,
+                crate::scanner::file_carving::FileSignature::MKV,
+                crate::scanner::file_carving::FileSignature::WEBM,
+                crate::scanner::file_carving::FileSignature::MOV,
+                crate::scanner::file_carving::FileSignature::FLV,
+                crate::scanner::file_carving::FileSignature::WMV,
+                crate::scanner::file_carving::FileSignature::THREE_GP,
+
+                // Audio
+                crate::scanner::file_carving::FileSignature::MP3,
+                crate::scanner::file_carving::FileSignature::WAV,
+                crate::scanner::file_carving::FileSignature::FLAC,
+                crate::scanner::file_carving::FileSignature::M4A,
+
+                // Archives
+                crate::scanner::file_carving::FileSignature::ZIP,
+                crate::scanner::file_carving::FileSignature::RAR,
+                crate::scanner::file_carving::FileSignature::SEVEN_ZIP,
+                crate::scanner::file_carving::FileSignature::TAR_GZ,
+
+                // Executables
+                crate::scanner::file_carving::FileSignature::EXE,
+                crate::scanner::file_carving::FileSignature::DLL,
+
+                // Databases
+                crate::scanner::file_carving::FileSignature::SQLITE,
+
+                // Disk Images
+                crate::scanner::file_carving::FileSignature::ISO,
+                crate::scanner::file_carving::FileSignature::VMDK,
+
+                // Machine Learning
+                crate::scanner::file_carving::FileSignature::SAFETENSORS,
+                crate::scanner::file_carving::FileSignature::ONNX,
+
+                // Other
+                crate::scanner::file_carving::FileSignature::TORRENT,
+            ];
+
+            let bytes_per_cluster = boot_sector.bytes_per_sector as u64 * boot_sector.sectors_per_cluster as u64;
+            let sector_size = boot_sector.bytes_per_sector as u64;
+
+            // Scan up to configured cluster limit to find file signatures
+            let max_clusters = self.file_carving_cluster_limit.min(boot_sector.total_sectors / boot_sector.sectors_per_cluster as u64);
+            let start_cluster = 2; // Clusters start at 2
+            let end_cluster = start_cluster + max_clusters;
+
+            *scan_status.lock().unwrap() = format!("File Carving: Scanning {} clusters (parallel mode: {} threads)...", max_clusters, self.parallel_threads);
+
+            if let Some(ref mut log) = log_file {
+                let _ = writeln!(log, "File carving configured for {} parallel threads", self.parallel_threads);
+                let _ = writeln!(log, "Note: Parallel scanning active for improved performance");
+                let _ = log.flush();
+            }
+
+            // Perform parallel file carving using rayon for maximum performance
+            let max_carved_files = self.file_carving_max_files;
+            let carved_count = Arc::new(AtomicU64::new(0));
+            let should_terminate = Arc::new(AtomicBool::new(false));
+            let progress_counter = Arc::new(AtomicU64::new(0));
+
+            // Configure rayon thread pool
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(self.parallel_threads)
+                .build()
+                .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+            // Process clusters in parallel chunks
+            let chunk_size = 10_000u64; // Process 10K clusters per batch
+            let total_chunks = ((end_cluster - start_cluster + 1) + chunk_size - 1) / chunk_size;
+
+            pool.install(|| {
+                (0..total_chunks).into_par_iter().for_each(|chunk_idx| {
+                    // Early termination checks
+                    if should_terminate.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    if *should_stop.lock().unwrap() {
+                        should_terminate.store(true, Ordering::Relaxed);
+                        return;
+                    }
+
+                    if carved_count.load(Ordering::Relaxed) >= max_carved_files {
+                        should_terminate.store(true, Ordering::Relaxed);
+                        return;
+                    }
+
+                    let chunk_start = start_cluster + (chunk_idx * chunk_size);
+                    let chunk_end = (chunk_start + chunk_size - 1).min(end_cluster);
+
+                    // Open disk handle per thread (thread-safe)
+                    let thread_disk = match DiskHandle::open(self.drive_letter) {
+                        Ok(d) => d,
+                        Err(_) => return,
+                    };
+
+                    let thread_carver = crate::scanner::file_carving::FileCarver::new(self.drive_letter);
+
+                    for cluster in chunk_start..=chunk_end {
+                        // Check termination conditions
+                        if should_terminate.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        if carved_count.load(Ordering::Relaxed) >= max_carved_files {
+                            should_terminate.store(true, Ordering::Relaxed);
+                            break;
+                        }
+
+                        // Progress update every 500,000 clusters
+                        let clusters_processed = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        if clusters_processed % 500_000 == 0 {
+                            let progress = (clusters_processed as f64 / max_clusters as f64) * 100.0;
+                            let gb_scanned = (clusters_processed as f64 * bytes_per_cluster as f64) / 1_073_741_824.0;
+                            let current_count = carved_count.load(Ordering::Relaxed);
+
+                            *scan_status.lock().unwrap() = format!(
+                                "File Carving: {:.1}% ({:.1} GB scanned, {} files)",
+                                progress, gb_scanned, current_count
+                            );
+                        }
+
+                        // Scan this cluster for signatures (no log_file in parallel context)
+                        if let Some((sig, cluster_num)) = thread_carver.scan_cluster_for_signature(
+                            &thread_disk,
+                            cluster,
+                            boot_sector.sectors_per_cluster as u64,
+                            0,
+                            sector_size,
+                            &signatures,
+                            &mut None,
+                        ) {
+                            // Apply filters
+                            let filename = format!("recovered_{}.{}", cluster, sig.extension);
+                            let full_path = format!("{}:\\recovered_{}.{}", self.drive_letter, cluster, sig.extension);
+
+                            let mut include = true;
+
+                            if let Some(filter) = filename_filter {
+                                if !filter.is_empty() && !filename.to_lowercase().contains(&filter.to_lowercase()) {
+                                    include = false;
+                                }
+                            }
+
+                            if let Some(path_filter) = folder_path {
+                                if !path_filter.is_empty() && !full_path.to_lowercase().contains(&path_filter.to_lowercase()) {
+                                    include = false;
+                                }
+                            }
+
+                            if include {
+                                let current = carved_count.fetch_add(1, Ordering::Relaxed);
+
+                                // Stop if we exceeded max after increment
+                                if current >= max_carved_files {
+                                    should_terminate.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+
+                                // Parse file header to determine actual file size
+                                let (file_size, cluster_count) = if let Some(parsed_size) = thread_carver.parse_file_size(
+                                    &thread_disk,
+                                    cluster_num,
+                                    boot_sector.sectors_per_cluster as u64,
+                                    0,
+                                    sector_size,
+                                    &sig,
+                                    &mut None,
+                                ) {
+                                    let clusters_needed = (parsed_size + bytes_per_cluster - 1) / bytes_per_cluster;
+                                    (parsed_size, clusters_needed)
+                                } else {
+                                    // Fallback to estimation if parsing fails
+                                    let estimated_clusters = match sig.extension {
+                                        "png" | "gif" => 64,
+                                        "jpg" => 128,
+                                        "pdf" => 256,
+                                        "doc" | "docx" => 128,
+                                        "xls" | "xlsx" => 256,
+                                        "ppt" | "pptx" => 512,
+                                        "mp3" | "wav" => 1024,
+                                        "mp4" | "avi" | "mkv" => 25600,
+                                        "zip" | "rar" | "7z" => 2048,
+                                        _ => 256,
+                                    };
+
+                                    let estimated_size = bytes_per_cluster * estimated_clusters;
+                                    (estimated_size, estimated_clusters)
+                                };
+
+                                files_output.lock().unwrap().push(DeletedFile {
+                                    name: filename.clone(),
+                                    path: full_path.clone(),
+                                    size: file_size,
+                                    size_formatted: crate::scanner::DeletedFile::format_size(file_size),
+                                    deleted_time: None,
+                                    file_record: cluster_num,
+                                    clusters: Vec::new(),
+                                    cluster_ranges: vec![super::ClusterRange {
+                                        start: cluster_num,
+                                        count: cluster_count,
+                                    }],
+                                    is_recoverable: true,
+                                    filesystem_type: format!("NTFS (File Carving: {})", sig.description),
+                                });
+                            }
+                        }
+                    }
+                });
+            });
+
+            let final_count = carved_count.load(Ordering::Relaxed);
+
+            if let Some(ref mut log) = log_file {
+                let _ = writeln!(log, "File carving complete. Added {} files (after filters)", final_count);
+                let _ = writeln!(log, "Parallel scanning used {} threads", self.parallel_threads);
+                let _ = log.flush();
+            }
+        }
+
+        if let Some(ref mut log) = log_file {
+            let _ = writeln!(log, "");
+            let _ = writeln!(log, "=== Scan Summary ===");
+            let _ = writeln!(log, "Total files found: {}", files_output.lock().unwrap().len());
             let _ = log.flush();
         }
 
@@ -783,6 +1310,28 @@ impl FileSystemScanner for NtfsScanner {
 
     fn get_filesystem_type(&self) -> &str {
         "NTFS"
+    }
+}
+
+// Additional helper methods for NtfsScanner (outside trait implementation)
+impl NtfsScanner {
+    /// Build MFT cache for path reconstruction from USN Journal records
+    fn build_mft_cache_for_journal(&mut self, disk: &DiskHandle, boot_sector: &NtfsBootSector) -> HashMap<u64, String> {
+        let mut cache = HashMap::new();
+
+        // Read a subset of MFT records to build directory name cache
+        // This is a simplified version - only cache first 10,000 records
+        for record_num in 0..10_000 {
+            if let Ok(record_data) = self.read_mft_record(disk, boot_sector, record_num) {
+                if let Ok(Some(record)) = self.parse_mft_record(&record_data) {
+                    if let Ok(Some((name, _parent))) = self.extract_file_info_for_path(&record) {
+                        cache.insert(record_num, name);
+                    }
+                }
+            }
+        }
+
+        cache
     }
 }
 

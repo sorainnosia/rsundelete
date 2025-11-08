@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc, TimeZone};
 use std::fs::OpenOptions;
 use std::io::Write;
+use rayon::prelude::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 const EXFAT_ENTRY_SIZE: usize = 32;
 const EXFAT_FILE_ENTRY: u8 = 0x85;
@@ -12,11 +15,23 @@ const EXFAT_FILENAME_ENTRY: u8 = 0xC1;
 
 pub struct ExfatScanner {
     drive_letter: char,
+    directory_entries_limit: u64,
+    parallel_threads: usize,
 }
 
 impl ExfatScanner {
     pub fn new(drive_letter: char) -> Self {
-        Self { drive_letter }
+        Self {
+            drive_letter,
+            directory_entries_limit: 1_000_000, // Default
+            parallel_threads: 8, // Default
+        }
+    }
+
+    /// Set configuration limits
+    pub fn set_config(&mut self, directory_entries_limit: u64, parallel_threads: usize) {
+        self.directory_entries_limit = directory_entries_limit;
+        self.parallel_threads = parallel_threads.max(1).min(32);
     }
 
     fn read_boot_sector(&self, disk: &DiskHandle) -> Result<ExfatBootSector> {
@@ -425,6 +440,7 @@ impl ExfatScanner {
                     name: file.filename.clone(),
                     path: full_path.clone(),
                     size: file.size,
+                    size_formatted: crate::scanner::DeletedFile::format_size(file.size),
                     deleted_time: None,
                     file_record: file.first_cluster as u64,
                     clusters,
@@ -493,10 +509,12 @@ impl FileSystemScanner for ExfatScanner {
         folder_path: Option<&str>,
         filename_filter: Option<&str>,
     ) -> Result<Vec<DeletedFile>> {
-        // Create log file
-        let log_path = std::env::var("USERPROFILE")
-            .map(|base| format!("{}\\Desktop\\rsundelete_debug.log", base))
-            .unwrap_or_else(|_| "C:\\rsundelete_debug.log".to_string());
+        // Create log file in the executable directory
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe_path| exe_path.parent().map(|p| p.join("rsundelete_debug.log")))
+            .and_then(|path| path.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "rsundelete_debug.log".to_string());
 
         let mut log_file = OpenOptions::new()
             .create(true)
@@ -593,11 +611,14 @@ impl FileSystemScanner for ExfatScanner {
         filename_filter: Option<&str>,
         files_output: &std::sync::Arc<std::sync::Mutex<Vec<DeletedFile>>>,
         should_stop: &std::sync::Arc<std::sync::Mutex<bool>>,
+        _scan_status: &std::sync::Arc<std::sync::Mutex<String>>,
     ) -> Result<bool> {
-        // Create log file
-        let log_path = std::env::var("USERPROFILE")
-            .map(|base| format!("{}\\Desktop\\rsundelete_debug.log", base))
-            .unwrap_or_else(|_| "C:\\rsundelete_debug.log".to_string());
+        // Create log file in the executable directory
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe_path| exe_path.parent().map(|p| p.join("rsundelete_debug.log")))
+            .and_then(|path| path.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "rsundelete_debug.log".to_string());
 
         let mut log_file = OpenOptions::new()
             .create(true)
@@ -609,6 +630,8 @@ impl FileSystemScanner for ExfatScanner {
             let _ = writeln!(log, "");
             let _ = writeln!(log, "=== exFAT Scan (Real-time mode) ===");
             let _ = writeln!(log, "Drive: {}", drive_letter);
+            let _ = writeln!(log, "Parallel threads configured: {} (directory traversal is sequential)", self.parallel_threads);
+            let _ = writeln!(log, "Note: exFAT uses sequential directory traversal due to its recursive structure");
             let _ = log.flush();
         }
 
@@ -745,6 +768,7 @@ impl ExfatScanner {
                     name: file.filename.clone(),
                     path: full_path.clone(),
                     size: file.size,
+                    size_formatted: crate::scanner::DeletedFile::format_size(file.size),
                     deleted_time: None,
                     file_record: file.first_cluster as u64,
                     clusters,

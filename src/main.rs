@@ -2,6 +2,7 @@
 
 mod scanner;
 mod recovery;
+mod config;
 
 use eframe::egui;
 use scanner::{DeletedFile, FileSystemScanner, disk_access};
@@ -10,6 +11,7 @@ use scanner::exfat::ExfatScanner;
 use recovery::FileRecovery;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::collections::HashSet;
 
 fn main() -> Result<(), eframe::Error> {
     // Load icon from icon.ico file
@@ -58,16 +60,30 @@ struct RunDeleteApp {
     deleted_files: Arc<Mutex<Vec<DeletedFile>>>,
     is_scanning: Arc<Mutex<bool>>,
     should_stop_scan: Arc<Mutex<bool>>,
+    is_paused: Arc<Mutex<bool>>,
     scan_error: Arc<Mutex<Option<String>>>,
     scan_status: Arc<Mutex<String>>,
+    scan_progress: Arc<Mutex<f32>>, // 0.0 to 1.0
 
     // Search/filter in results
     result_search_filter: String,
+    size_search_filter: String,
+    file_type_filter: String, // "All", "Images", "Documents", "Archives", "Videos"
+
+    // Multi-select state
+    selected_files: std::collections::HashSet<usize>,
+
+    // Sorting state
+    sort_by: String, // "name", "size", "path", "type"
+    sort_ascending: bool,
 
     // Recovery state
     recovery_status: Arc<Mutex<String>>,
     is_recovering: Arc<Mutex<bool>>,
     recovery_progress: Arc<Mutex<String>>,
+
+    // Configuration
+    config: config::ScanConfig,
 }
 
 impl Default for RunDeleteApp {
@@ -79,12 +95,20 @@ impl Default for RunDeleteApp {
             deleted_files: Arc::new(Mutex::new(Vec::new())),
             is_scanning: Arc::new(Mutex::new(false)),
             should_stop_scan: Arc::new(Mutex::new(false)),
+            is_paused: Arc::new(Mutex::new(false)),
             scan_error: Arc::new(Mutex::new(None)),
             scan_status: Arc::new(Mutex::new(String::new())),
+            scan_progress: Arc::new(Mutex::new(0.0)),
             result_search_filter: String::new(),
+            size_search_filter: String::new(),
+            file_type_filter: "All".to_string(),
+            selected_files: std::collections::HashSet::new(),
+            sort_by: "name".to_string(),
+            sort_ascending: true,
             recovery_status: Arc::new(Mutex::new(String::new())),
             is_recovering: Arc::new(Mutex::new(false)),
             recovery_progress: Arc::new(Mutex::new(String::new())),
+            config: config::ScanConfig::load(),
         }
     }
 }
@@ -137,6 +161,8 @@ impl RunDeleteApp {
             Some(self.filename_filter.clone())
         };
 
+        let config = self.config.clone();
+
         // Spawn scanning thread
         thread::spawn(move || {
             *scan_status.lock().unwrap() = format!("Detecting filesystem type on drive {}...", drive_char);
@@ -148,6 +174,7 @@ impl RunDeleteApp {
                 &scan_status,
                 &deleted_files,
                 &should_stop_scan,
+                &config,
             );
 
             match result {
@@ -238,6 +265,140 @@ impl RunDeleteApp {
                 *is_recovering.lock().unwrap() = false;
             });
         }
+    }
+
+    fn recover_selected_files(&mut self) {
+        let drive_str = self.selected_drive.trim();
+        if drive_str.is_empty() {
+            *self.recovery_status.lock().unwrap() = "Error: No source drive selected".to_string();
+            return;
+        }
+
+        // Check if already recovering
+        if *self.is_recovering.lock().unwrap() {
+            *self.recovery_status.lock().unwrap() = "Recovery already in progress...".to_string();
+            return;
+        }
+
+        if self.selected_files.is_empty() {
+            *self.recovery_status.lock().unwrap() = "Error: No files selected".to_string();
+            return;
+        }
+
+        let source_drive = drive_str.chars().next().unwrap().to_uppercase().next().unwrap();
+
+        // Open folder dialog for batch recovery
+        let folder_dialog = rfd::FileDialog::new()
+            .set_title("Select folder to save recovered files");
+
+        if let Some(dest_folder) = folder_dialog.pick_folder() {
+            // Validate drive
+            let dest_path_str = dest_folder.to_string_lossy().to_string();
+            if let Some(dest_drive) = dest_path_str.chars().next() {
+                if dest_drive.to_uppercase().next().unwrap() == source_drive {
+                    *self.recovery_status.lock().unwrap() = format!(
+                        "Error: Destination must be on a different drive than {}:",
+                        source_drive
+                    );
+                    return;
+                }
+            }
+
+            // Get selected files
+            let files_to_recover: Vec<DeletedFile> = {
+                let files = self.deleted_files.lock().unwrap();
+                self.selected_files.iter()
+                    .filter_map(|&idx| files.get(idx).cloned())
+                    .collect()
+            };
+
+            let total_files = files_to_recover.len();
+
+            // Mark as recovering
+            *self.is_recovering.lock().unwrap() = true;
+            *self.recovery_progress.lock().unwrap() = format!("Starting batch recovery of {} files...", total_files);
+            *self.recovery_status.lock().unwrap() = String::new();
+
+            let recovery_status = Arc::clone(&self.recovery_status);
+            let is_recovering = Arc::clone(&self.is_recovering);
+            let recovery_progress = Arc::clone(&self.recovery_progress);
+
+            // Clear selection after starting recovery
+            self.selected_files.clear();
+
+            // Spawn recovery thread
+            thread::spawn(move || {
+                let recovery = FileRecovery::new(source_drive);
+                let mut success_count = 0;
+                let mut fail_count = 0;
+
+                for (i, file) in files_to_recover.iter().enumerate() {
+                    // Update progress
+                    *recovery_progress.lock().unwrap() = format!(
+                        "Recovering file {} of {}: {} ({:.2} MB)...",
+                        i + 1,
+                        total_files,
+                        file.name,
+                        file.size as f64 / 1_000_000.0
+                    );
+
+                    // Create destination path
+                    let dest_path = dest_folder.join(&file.name);
+
+                    match recovery.recover_file(&file, &dest_path, recovery_progress.clone()) {
+                        Ok(_) => {
+                            success_count += 1;
+                        }
+                        Err(e) => {
+                            fail_count += 1;
+                            eprintln!("Failed to recover {}: {}", file.name, e);
+                        }
+                    }
+                }
+
+                // Final status
+                *recovery_status.lock().unwrap() = format!(
+                    "Batch recovery complete!\nSuccessfully recovered: {}\nFailed: {}\nLocation: {}",
+                    success_count, fail_count, dest_folder.display()
+                );
+                *recovery_progress.lock().unwrap() = format!("Complete: {} succeeded, {} failed", success_count, fail_count);
+                *is_recovering.lock().unwrap() = false;
+            });
+        }
+    }
+
+    fn export_to_csv(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Open save dialog
+        let file_dialog = rfd::FileDialog::new()
+            .set_file_name("recovered_files.csv")
+            .add_filter("CSV", &["csv"])
+            .set_title("Export file list to CSV");
+
+        if let Some(path) = file_dialog.save_file() {
+            let mut writer = csv::Writer::from_path(&path)?;
+
+            // Write header
+            writer.write_record(&["Name", "Path", "Size", "Size (Bytes)", "Type", "Recoverable", "Filesystem"])?;
+
+            // Write file data
+            let files = self.deleted_files.lock().unwrap();
+            for file in files.iter() {
+                writer.write_record(&[
+                    &file.name,
+                    &file.path,
+                    &file.size_formatted,
+                    &file.size.to_string(),
+                    get_extension(&file.name),
+                    &file.is_recoverable.to_string(),
+                    &file.filesystem_type,
+                ])?;
+            }
+
+            writer.flush()?;
+            *self.recovery_status.lock().unwrap() = format!("Successfully exported {} files to: {}", files.len(), path.display());
+        }
+
+        Ok(())
     }
 }
 
@@ -484,31 +645,11 @@ impl eframe::App for RunDeleteApp {
                 ui.add_space(10.0);
             }
 
-            // Results section
+            // Results section - show files if any found, or placeholder if not scanning
             let files = self.deleted_files.lock().unwrap();
 
-            if files.is_empty() && !is_scanning {
-                egui::Frame::none()
-                    .fill(egui::Color32::WHITE)
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(0, 0, 0, 20)))
-                    .rounding(12.0)
-                    .inner_margin(14.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            egui::RichText::new("Deleted Files")
-                                .size(14.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(51, 51, 77))
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new("No deleted files found. Click 'Scan' to search.")
-                                .size(13.0)
-                                .color(egui::Color32::from_rgb(153, 153, 179))
-                        );
-                    });
-            } else if !files.is_empty() {
+            if !files.is_empty() {
+                // Files found - show them (whether scanning or not)
                 // Clone files to avoid borrow checker issues
                 let files_clone: Vec<DeletedFile> = files.clone();
                 drop(files); // Release the lock
@@ -534,40 +675,183 @@ impl eframe::App for RunDeleteApp {
                                 .num_columns(3)
                                 .spacing([10.0, 6.0])
                                 .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("🔍 Search:").size(13.0).color(egui::Color32::from_rgb(102, 102, 128)));
-                                    always_bordered_text_edit(ui, &mut self.result_search_filter, 400.0);
+                                    ui.label(egui::RichText::new("🔍 Name/Location:").size(13.0).color(egui::Color32::from_rgb(102, 102, 128)));
+                                    always_bordered_text_edit(ui, &mut self.result_search_filter, 300.0);
                                 });
                             if !self.result_search_filter.is_empty() {
                                 ui.add_space(5.0);
-                                ui.label(egui::RichText::new(format!("(filtering by: \"{}\")", self.result_search_filter))
+                                ui.label(egui::RichText::new(format!("(name/path: \"{}\")", self.result_search_filter))
                                     .size(11.0)
                                     .color(egui::Color32::from_rgb(153, 153, 179)));
                             }
                         });
+                        ui.add_space(5.0);
+
+                        // File Type Filter dropdown
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("📁 File Type:").size(13.0).color(egui::Color32::from_rgb(102, 102, 128)));
+                            egui::ComboBox::from_id_salt("file_type_filter")
+                                .selected_text(&self.file_type_filter)
+                                .width(200.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.file_type_filter, "All".to_string(), "All Files");
+                                    ui.selectable_value(&mut self.file_type_filter, "Images".to_string(), "Images (PNG, JPG, GIF, BMP)");
+                                    ui.selectable_value(&mut self.file_type_filter, "Documents".to_string(), "Documents (PDF, DOC, XLS, PPT)");
+                                    ui.selectable_value(&mut self.file_type_filter, "Archives".to_string(), "Archives (ZIP, RAR, 7Z)");
+                                    ui.selectable_value(&mut self.file_type_filter, "Videos".to_string(), "Videos (MP4, AVI, MOV)");
+                                    ui.selectable_value(&mut self.file_type_filter, "Audio".to_string(), "Audio (MP3, WAV, FLAC)");
+                                });
+                        });
+                        ui.add_space(5.0);
+
+                        /*
+                        // Size Search textbox
+                        ui.horizontal(|ui| {
+                            egui::Grid::new("size_search_grid")
+                                .num_columns(3)
+                                .spacing([10.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("📏 Size Search:").size(13.0).color(egui::Color32::from_rgb(102, 102, 128)));
+                                    always_bordered_text_edit(ui, &mut self.size_search_filter, 300.0);
+                                });
+                            if !self.size_search_filter.is_empty() {
+                                ui.add_space(5.0);
+                                ui.label(egui::RichText::new(format!("(e.g., 1.18MB, 500KB, 2GB, 1TB | tolerance: ±{})", self.config.size_search_tolerance))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(153, 153, 179)));
+                            } else {
+                                ui.add_space(5.0);
+                                ui.label(egui::RichText::new(format!("(tolerance: ±{})", self.config.size_search_tolerance))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(153, 153, 179)));
+                            }
+                        }); */
                         ui.add_space(10.0);
 
-                        // Filter files based on search input
-                        let filtered_files: Vec<_> = if self.result_search_filter.is_empty() {
-                            files_clone.iter().enumerate().collect()
+                        // Trim filters to handle whitespace (clone to avoid borrow issues)
+                        let name_filter_trimmed = self.result_search_filter.trim().to_string();
+                        let size_filter_trimmed = self.size_search_filter.trim().to_string();
+
+                        // Parse size filter if provided
+                        let size_range = if !size_filter_trimmed.is_empty() {
+                            let range = parse_size_filter(&size_filter_trimmed, &self.config.size_search_tolerance);
+                            if let Some((min, max)) = range {
+                                println!("Size filter: '{}' -> range [{} to {}] bytes ({} to {} MB)",
+                                    size_filter_trimmed, min, max, min / 1_048_576, max / 1_048_576);
+                            }
+                            range
                         } else {
-                            let search_lower = self.result_search_filter.to_lowercase();
-                            files_clone.iter().enumerate()
-                                .filter(|(_, file)| {
-                                    file.name.to_lowercase().contains(&search_lower) ||
-                                    file.path.to_lowercase().contains(&search_lower)
-                                })
-                                .collect()
+                            None
                         };
 
-                        // Show filtered count if filtering
-                        if !self.result_search_filter.is_empty() && filtered_files.len() != files_clone.len() {
-                            ui.label(
-                                egui::RichText::new(format!("Showing {} of {} files", filtered_files.len(), files_clone.len()))
-                                    .size(12.0)
-                                    .color(egui::Color32::from_rgb(51, 128, 230))
-                            );
-                            ui.add_space(5.0);
-                        }
+                        // Filter files based on search input, size, and file type
+                        let filtered_files: Vec<_> = files_clone.iter().enumerate()
+                            .filter(|(_, file)| {
+                                // Name/location filter
+                                let name_match = if name_filter_trimmed.is_empty() {
+                                    true
+                                } else {
+                                    let search_lower = name_filter_trimmed.to_lowercase();
+                                    file.name.to_lowercase().contains(&search_lower) ||
+                                    file.path.to_lowercase().contains(&search_lower)
+                                };
+
+                                // Size filter
+                                let size_match = if let Some((min_size, max_size)) = size_range {
+                                    file.size >= min_size && file.size <= max_size
+                                } else {
+                                    true
+                                };
+
+                                // File type filter
+                                let type_match = matches_file_type_filter(&file.name, &self.file_type_filter);
+
+                                name_match && size_match && type_match
+                            })
+                            .collect();
+
+                        // Show filtered count and selection controls
+                        ui.horizontal(|ui| {
+                            if (!name_filter_trimmed.is_empty() || size_range.is_some()) && filtered_files.len() != files_clone.len() {
+                                ui.label(
+                                    egui::RichText::new(format!("Showing {} of {} files", filtered_files.len(), files_clone.len()))
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(51, 128, 230))
+                                );
+                            }
+
+                            ui.add_space(10.0);
+
+                            // Select All / Deselect All buttons
+                            ui.horizontal(|ui| {
+                                let select_all_button = egui::Button::new(
+                                    egui::RichText::new("Select All")
+                                        .size(12.0)
+                                )
+                                .min_size(egui::vec2(100.0, 26.0));
+
+                                if ui.add(select_all_button).clicked() {
+                                    for (index, _) in &filtered_files {
+                                        self.selected_files.insert(*index);
+                                    }
+                                }
+
+                                let deselect_all_button = egui::Button::new(
+                                    egui::RichText::new("Deselect All")
+                                        .size(12.0)
+                                )
+                                .min_size(egui::vec2(100.0, 26.0));
+
+                                if ui.add(deselect_all_button).clicked() {
+                                    self.selected_files.clear();
+                                }
+                            });
+
+                            ui.add_space(8.0);
+
+                            // Show selection count
+                            if !self.selected_files.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!("({} selected)", self.selected_files.len()))
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(51, 128, 230))
+                                );
+                            }
+
+                            // Recover Selected button
+                            if !self.selected_files.is_empty() {
+                                let recover_button = egui::Button::new(
+                                    egui::RichText::new(format!("💾 Recover Selected ({})", self.selected_files.len()))
+                                        .size(12.0)
+                                        .color(egui::Color32::WHITE)
+                                )
+                                .fill(egui::Color32::from_rgb(76, 175, 80))
+                                .min_size(egui::vec2(150.0, 28.0));
+
+                                if ui.add(recover_button).clicked() {
+                                    self.recover_selected_files();
+                                }
+                            }
+
+                            // Export to CSV button
+                            if !files_clone.is_empty() {
+                                ui.add_space(10.0);
+                                let export_button = egui::Button::new(
+                                    egui::RichText::new("📊 Export to CSV")
+                                        .size(12.0)
+                                        .color(egui::Color32::WHITE)
+                                )
+                                .fill(egui::Color32::from_rgb(255, 152, 0))
+                                .min_size(egui::vec2(120.0, 28.0));
+
+                                if ui.add(export_button).clicked() {
+                                    if let Err(e) = self.export_to_csv() {
+                                        *self.recovery_status.lock().unwrap() = format!("Export failed: {}", e);
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(5.0);
 
                         egui::ScrollArea::both()
                             .max_height(400.0)
@@ -585,6 +869,16 @@ impl eframe::App for RunDeleteApp {
                                         .inner_margin(egui::Margin::symmetric(8.0, 10.0))
                                         .show(ui, |ui| {
                                             ui.horizontal(|ui| {
+                                                // Checkbox for selection
+                                                let mut is_selected = self.selected_files.contains(index);
+                                                if ui.checkbox(&mut is_selected, "").changed() {
+                                                    if is_selected {
+                                                        self.selected_files.insert(*index);
+                                                    } else {
+                                                        self.selected_files.remove(index);
+                                                    }
+                                                }
+
                                                 ui.vertical(|ui| {
                                                     ui.label(
                                                         egui::RichText::new(&file.name)
@@ -598,18 +892,8 @@ impl eframe::App for RunDeleteApp {
                                                             .color(egui::Color32::from_rgb(102, 102, 128))
                                                     );
 
-                                                    let size_str = if file.size > 1_000_000_000 {
-                                                        format!("{:.2} GB", file.size as f64 / 1_000_000_000.0)
-                                                    } else if file.size > 1_000_000 {
-                                                        format!("{:.2} MB", file.size as f64 / 1_000_000.0)
-                                                    } else if file.size > 1_000 {
-                                                        format!("{:.2} KB", file.size as f64 / 1_000.0)
-                                                    } else {
-                                                        format!("{} bytes", file.size)
-                                                    };
-
                                                     ui.label(
-                                                        egui::RichText::new(format!("Size: {}", size_str))
+                                                        egui::RichText::new(format!("Size: {}", file.size_formatted))
                                                             .size(12.0)
                                                             .color(egui::Color32::from_rgb(102, 102, 128))
                                                     );
@@ -641,7 +925,30 @@ impl eframe::App for RunDeleteApp {
                                 }
                             });
                     });
+            } else if files.is_empty() && !is_scanning {
+                // Not scanning and no files found - show placeholder
+                egui::Frame::none()
+                    .fill(egui::Color32::WHITE)
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(0, 0, 0, 20)))
+                    .rounding(12.0)
+                    .inner_margin(14.0)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new("Deleted Files")
+                                .size(14.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(51, 51, 77))
+                        );
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("No deleted files found. Click 'Scan' to search.")
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(153, 153, 179))
+                        );
+                    });
             }
+            // If scanning and no files, show nothing (scanning progress is shown above)
                 }); // Close margin Frame
         }); // Close egui::CentralPanel
 
@@ -659,14 +966,18 @@ fn perform_scan(
     scan_status: &Arc<Mutex<String>>,
     deleted_files: &Arc<Mutex<Vec<DeletedFile>>>,
     should_stop: &Arc<Mutex<bool>>,
+    config: &config::ScanConfig,
 ) -> anyhow::Result<bool> {
     // Create initial log file to verify we can write to Desktop
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    let log_path = std::env::var("USERPROFILE")
-        .map(|base| format!("{}\\Desktop\\rsundelete_debug.log", base))
-        .unwrap_or_else(|_| "C:\\rsundelete_debug.log".to_string());
+    // Get the directory where the executable is located
+    let log_path = std::env::current_exe()
+        .ok()
+        .and_then(|exe_path| exe_path.parent().map(|p| p.join("rsundelete_debug.log")))
+        .and_then(|path| path.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "rsundelete_debug.log".to_string());
 
     let mut early_log = OpenOptions::new()
         .create(true)
@@ -734,11 +1045,20 @@ fn perform_scan(
     let was_stopped = match fs_type {
         disk_access::FileSystemType::NTFS => {
             let mut scanner = NtfsScanner::new(drive);
-            scanner.scan_realtime(drive, folder_path, filename_filter, deleted_files, should_stop)?
+            scanner.set_config(
+                config.ntfs_mft_system_drive_limit,
+                config.ntfs_mft_spare_drive_limit,
+                config.ntfs_usn_journal_limit,
+                config.file_carving_cluster_limit,
+                config.file_carving_max_files,
+                config.parallel_scan_threads,
+            );
+            scanner.scan_realtime(drive, folder_path, filename_filter, deleted_files, should_stop, scan_status)?
         }
         disk_access::FileSystemType::ExFAT => {
             let mut scanner = ExfatScanner::new(drive);
-            scanner.scan_realtime(drive, folder_path, filename_filter, deleted_files, should_stop)?
+            scanner.set_config(config.exfat_directory_entries_limit, config.parallel_scan_threads);
+            scanner.scan_realtime(drive, folder_path, filename_filter, deleted_files, should_stop, scan_status)?
         }
         _ => {
             anyhow::bail!("Unsupported filesystem type. Only NTFS and exFAT are supported.");
@@ -749,4 +1069,84 @@ fn perform_scan(
     deleted_files.lock().unwrap().sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(was_stopped)
+}
+
+/// Get file extension from filename
+fn get_extension(filename: &str) -> &str {
+    filename.rsplit('.').next().unwrap_or("")
+}
+
+/// Check if filename matches the selected file type filter
+fn matches_file_type_filter(filename: &str, filter: &str) -> bool {
+    if filter == "All" {
+        return true;
+    }
+
+    let ext = get_extension(filename).to_lowercase();
+    match filter {
+        "Images" => matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tiff" | "webp" | "ico"),
+        "Documents" => matches!(ext.as_str(), "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "rtf" | "odt" | "ods" | "odp"),
+        "Archives" => matches!(ext.as_str(), "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "iso"),
+        "Videos" => matches!(ext.as_str(), "mp4" | "avi" | "mov" | "mkv" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg"),
+        "Audio" => matches!(ext.as_str(), "mp3" | "wav" | "flac" | "aac" | "ogg" | "wma" | "m4a" | "opus"),
+        _ => true,
+    }
+}
+
+/// Parse size string and return size in bytes
+/// Supports formats like: "1.18MB", "1.18 MB", "500KB", "2GB", "1TB"
+fn parse_size_string(size_str: &str) -> Option<u64> {
+    let size_str = size_str.trim().to_uppercase();
+
+    // Extract number and unit
+    let mut num_str = String::new();
+    let mut unit = String::new();
+
+    for ch in size_str.chars() {
+        if ch.is_numeric() || ch == '.' {
+            if unit.is_empty() {
+                num_str.push(ch);
+            }
+        } else if ch.is_alphabetic() {
+            unit.push(ch);
+        }
+    }
+
+    // Parse the number
+    let number: f64 = num_str.parse().ok()?;
+
+    // Determine multiplier based on unit
+    let multiplier: u64 = if unit.contains("TB") || unit == "T" {
+        1_099_511_627_776 // 1 TB
+    } else if unit.contains("GB") || unit == "G" {
+        1_073_741_824 // 1 GB
+    } else if unit.contains("MB") || unit == "M" {
+        1_048_576 // 1 MB
+    } else if unit.contains("KB") || unit == "K" {
+        1_024 // 1 KB
+    } else if unit.contains("B") || unit.is_empty() {
+        1 // bytes
+    } else {
+        return None; // Unknown unit
+    };
+
+    // Calculate size in bytes
+    Some((number * multiplier as f64) as u64)
+}
+
+/// Parse size filter string and return (min_size, max_size) in bytes
+/// Supports formats like: "1.18MB", "1.18 MB", "500KB", "2GB", "1TB"
+/// Applies configurable tolerance range (e.g., ±5MB)
+fn parse_size_filter(size_str: &str, tolerance_str: &str) -> Option<(u64, u64)> {
+    // Parse the target size
+    let size_bytes = parse_size_string(size_str)?;
+
+    // Parse the tolerance/range
+    let tolerance_bytes = parse_size_string(tolerance_str).unwrap_or(5_242_880); // Default 5MB
+
+    // Apply ±tolerance range
+    let min_size = size_bytes.saturating_sub(tolerance_bytes);
+    let max_size = size_bytes.saturating_add(tolerance_bytes);
+
+    Some((min_size, max_size))
 }

@@ -22,10 +22,12 @@ impl FileRecovery {
         use std::fs::OpenOptions;
         use std::io::Write as IoWrite;
 
-        // Create recovery log
-        let log_path = std::env::var("USERPROFILE")
-            .map(|base| format!("{}\\Desktop\\recovery_debug.log", base))
-            .unwrap_or_else(|_| "C:\\recovery_debug.log".to_string());
+        // Create recovery log in the executable directory
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe_path| exe_path.parent().map(|p| p.join("recovery_debug.log")))
+            .and_then(|path| path.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "recovery_debug.log".to_string());
 
         let mut log_file = OpenOptions::new()
             .create(true)
@@ -273,13 +275,16 @@ impl FileRecovery {
         }
 
         // Process clusters based on filesystem type
-        if deleted_file.filesystem_type == "NTFS" && !deleted_file.cluster_ranges.is_empty() {
+        if deleted_file.filesystem_type.starts_with("NTFS") && !deleted_file.cluster_ranges.is_empty() {
             // NTFS: Process cluster ranges directly (memory efficient)
+            let is_carved = deleted_file.filesystem_type.contains("File Carving");
+
             if let Some(ref mut log) = log_file {
                 let _ = writeln!(log, "\n=== NTFS Recovery Details ===");
                 let _ = writeln!(log, "Total cluster ranges: {}", deleted_file.cluster_ranges.len());
                 let _ = writeln!(log, "Sectors per cluster: {}", sectors_per_cluster);
                 let _ = writeln!(log, "Sector size: {}", sector_size);
+                let _ = writeln!(log, "File type: {}", if is_carved { "File Carving" } else { "MFT" });
                 let _ = log.flush();
             }
 
@@ -296,7 +301,22 @@ impl FileRecovery {
                     }
 
                     let cluster = range.start + i;
-                    let sector = cluster * sectors_per_cluster;
+
+                    // Calculate sector based on whether this is carved or MFT-recovered
+                    let sector = if is_carved {
+                        // For carved files, cluster numbers are actual cluster numbers (2, 3, 4...)
+                        // NTFS: First data cluster is cluster 0 in sector terms
+                        // Cluster 2 -> sector 0, cluster 3 -> sector (1 * sectors_per_cluster), etc.
+                        if cluster >= 2 {
+                            (cluster - 2) * sectors_per_cluster
+                        } else {
+                            0 // Should not happen, but handle gracefully
+                        }
+                    } else {
+                        // For MFT-recovered files, cluster is LCN (Logical Cluster Number)
+                        // LCNs are already in the right format for NTFS
+                        cluster * sectors_per_cluster
+                    };
 
                     // Log first cluster of each range with detailed info
                     if i == 0 {
